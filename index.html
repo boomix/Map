@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Power grid map</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<style>
+  html, body { margin: 0; height: 100%; font: 13px/1.4 system-ui, sans-serif; }
+  #map { position: fixed; inset: 0; background: #111; }
+  #panel {
+    position: fixed; top: 10px; right: 10px; z-index: 10; width: 250px;
+    background: rgba(20, 22, 28, .92); color: #e8e8e8; border-radius: 8px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, .5); max-height: calc(100vh - 20px); overflow: auto;
+  }
+  #panel summary { padding: 10px 12px; cursor: pointer; font-weight: 600; }
+  #panel .body { padding: 0 12px 12px; }
+  #panel h4 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; color: #9aa; }
+  #panel label { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+  #panel label.range { display: block; }
+  #panel input[type=range], #panel select { width: 100%; }
+  #panel .sw { display: inline-block; width: 22px; height: 4px; border-radius: 2px; }
+  #panel button { margin: 8px 6px 0 0; padding: 4px 8px; cursor: pointer; }
+  #hint { margin-top: 8px; color: #9cf; }
+  #q { box-sizing: border-box; width: 100%; padding: 5px 8px; }
+  #results div { padding: 5px 4px; cursor: pointer; border-bottom: 1px solid #333; }
+  #results div:hover { background: #2a2f3a; }
+  #results .none { cursor: default; color: #9aa; }
+  .maplibregl-popup-content { color: #222; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<details id="panel" open>
+  <summary>Kristīnes vadu iestatījumi</summary>
+  <div class="body">
+    <h4>Search address</h4>
+    <form id="search"><input id="q" type="search" placeholder="Street, city…" autocomplete="off"></form>
+    <div id="results"></div>
+
+    <h4>Base map</h4>
+    <select id="base"></select>
+
+    <h4>Street &amp; place names</h4>
+    <label><input type="checkbox" data-key="names"> Street &amp; place names</label>
+    <label><input type="checkbox" data-key="labelsAll"> Also on non-satellite maps</label>
+
+    <h4>Grid layers</h4>
+    <div id="classes"></div>
+
+    <h4>Appearance</h4>
+    <label class="range">Line width <input type="range" id="width" min="0.5" max="4" step="0.1"></label>
+    <label class="range">Grid opacity <input type="range" id="opacity" min="0.2" max="1" step="0.05"></label>
+    <label><input type="checkbox" id="glow"> Glow</label>
+    <label class="range">Glow strength <input type="range" data-key="glowStrength" min="0.1" max="0.8" step="0.05"></label>
+
+    <h4>Map</h4>
+    <label><input type="checkbox" data-key="remember"> Remember last view</label>
+
+    <button id="locate">Locate me</button><button id="riga">Riga</button><button id="reset">Reset settings</button>
+    <div id="hint">Click a line or substation for details.</div>
+  </div>
+</details>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+const RIGA = [24.1052, 56.9496];
+
+const BASES = {
+  'Dark (Esri)': ['https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', 'Tiles © Esri', 16],
+  'OpenStreetMap': ['https://tile.openstreetmap.org/{z}/{x}/{y}.png', '© OpenStreetMap contributors', 19],
+  'Satellite (Esri)': ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', 'Tiles © Esri', 19],
+  'Light (Esri)': ['https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', 'Tiles © Esri', 16],
+};
+
+// OpenInfraMap vector tiles (OSM power data): `voltage` is in kV, `type` is the OSM power tag.
+const VOLTAGE = ['to-number', ['get', 'voltage'], 0];
+const IS_LINE = ['==', ['get', 'type'], 'line'];
+const CLASSES = [
+  { id: 'ehv',   label: '220 kV +',             color: '#ff3b3b', width: 4,   filter: ['all', IS_LINE, ['>=', VOLTAGE, 220]] },
+  { id: 'hv',    label: '110 kV',               color: '#ff9a1f', width: 3,   filter: ['all', IS_LINE, ['>=', VOLTAGE, 60], ['<', VOLTAGE, 220]] },
+  { id: 'mv',    label: '20–35 kV',             color: '#ffe433', width: 2.5, filter: ['all', IS_LINE, ['>=', VOLTAGE, 20], ['<', VOLTAGE, 60]] },
+  { id: 'lv',    label: 'Below 20 kV',          color: '#33e6ff', width: 2,   filter: ['all', IS_LINE, ['<', VOLTAGE, 20]] },
+  { id: 'minor', label: 'Minor lines',          color: '#5dff8a', width: 1.8, filter: ['==', ['get', 'type'], 'minor_line'] },
+  { id: 'cable', label: 'Underground cable',    color: '#d27bff', width: 2,   filter: ['==', ['get', 'type'], 'cable'], dash: [3, 2] },
+  { id: 'sub',   label: 'Substations / plants', color: '#ff3b3b' },
+  { id: 'tower', label: 'Towers / poles',       color: '#ffffff' },
+];
+const LINE_CLASSES = CLASSES.filter(c => c.filter);
+
+const DEFAULTS = {
+  base: 'Dark (Esri)', width: 1.5, opacity: 1, glow: true, glowStrength: 0.3,
+  names: true, labelsAll: false,
+  remember: false, view: null,
+  on: Object.fromEntries(CLASSES.map(c => [c.id, c.id !== 'cable'])),
+};
+const saved = JSON.parse(localStorage.getItem('gridMap') || '{}');
+const cfg = { ...DEFAULTS, ...saved, on: { ...DEFAULTS.on, ...saved.on } };
+if (!BASES[cfg.base]) cfg.base = DEFAULTS.base;
+const persist = () => localStorage.setItem('gridMap', JSON.stringify(cfg));
+
+const $ = id => document.getElementById(id);
+const baseId = name => 'base:' + name;
+const widthExpr = w => ['interpolate', ['linear'], ['zoom'],
+  6, w * cfg.width * 0.4, 11, w * cfg.width * 0.8, 15, w * cfg.width * 1.6, 19, w * cfg.width * 3];
+
+const sources = {
+  power: {
+    type: 'vector', tiles: ['https://openinframap.org/map/power/{z}/{x}/{y}.pbf'], maxzoom: 15,
+    attribution: 'Grid data © OpenStreetMap contributors via <a href="https://openinframap.org">OpenInfraMap</a>',
+  },
+};
+const layers = [];
+for (const [name, [url, attribution, maxzoom]] of Object.entries(BASES)) {
+  sources[baseId(name)] = { type: 'raster', tiles: [url], tileSize: 256, maxzoom, attribution };
+  layers.push({ id: baseId(name), type: 'raster', source: baseId(name),
+    layout: { visibility: name === cfg.base ? 'visible' : 'none' } });
+}
+
+const SATELLITE = 'Satellite (Esri)';
+// Text-only labels from OpenFreeMap vector tiles, so no road lines get drawn over the base map.
+const STREET_LABELS = 'labels:streets';
+const PLACE_LABELS = 'labels:places';
+const LABEL_MIN_ZOOM = { [STREET_LABELS]: 12, [PLACE_LABELS]: 0 };
+sources.omt = { type: 'vector', url: 'https://tiles.openfreemap.org/planet',
+  attribution: '© <a href="https://openfreemap.org">OpenFreeMap</a>' };
+const LIGHT_BASES = ['OpenStreetMap', 'Light (Esri)'];
+
+// Big transmission substations (110 kV and up) are red; small local transformer stations stay white.
+const IS_BIG_SUB = ['>=', VOLTAGE, 60];
+const subColor = ['case', IS_BIG_SUB, '#ff3b3b', '#ffffff'];
+const sub = { source: 'power', 'source-layer': 'power_substation' };
+layers.push(
+  { id: 'sub-fill', type: 'fill', ...sub, minzoom: 9,
+    paint: { 'fill-color': subColor, 'fill-opacity': 0.3 } },
+  { id: 'sub-outline', type: 'line', ...sub, minzoom: 9,
+    paint: { 'line-color': subColor,
+      'line-width': ['interpolate', ['linear'], ['zoom'],
+        9, ['case', IS_BIG_SUB, 2.5, 0.8], 14, ['case', IS_BIG_SUB, 3, 1.5]] } },
+  { id: 'plant-fill', type: 'fill', source: 'power', 'source-layer': 'power_plant', minzoom: 8,
+    paint: { 'fill-color': '#b388ff', 'fill-opacity': 0.35 } },
+  { id: 'sub-point', type: 'circle', source: 'power', 'source-layer': 'power_substation_point', minzoom: 11,
+    filter: ['any', ['!', IS_BIG_SUB], ['==', ['get', 'is_node'], true]],
+    paint: { 'circle-color': '#ffffff', 'circle-opacity': 0.55,
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 11, 1, 14, 2.5, 17, 6] } },
+);
+
+for (const c of LINE_CLASSES) {
+  const base = { source: 'power', 'source-layer': 'power_line', filter: c.filter,
+    layout: { 'line-cap': 'round', 'line-join': 'round' } };
+  layers.push(
+    { id: `${c.id}-glow`, type: 'line', ...base,
+      paint: { 'line-color': c.color, 'line-blur': 4, 'line-opacity': 0.3, 'line-width': widthExpr(c.width * 3.5) } },
+    { id: c.id, type: 'line', ...base,
+      paint: { 'line-color': c.color, 'line-opacity': cfg.opacity, 'line-width': widthExpr(c.width),
+        ...(c.dash && { 'line-dasharray': c.dash }) } },
+  );
+}
+
+layers.push({ id: 'voltage-labels', type: 'symbol', source: 'power', 'source-layer': 'power_line', minzoom: 11,
+  filter: ['all', IS_LINE, ['>', VOLTAGE, 0]],
+  layout: { 'symbol-placement': 'line', 'symbol-spacing': 350, 'text-field': ['concat', ['get', 'voltage'], ' kV'],
+    'text-font': ['Noto Sans Bold'], 'text-size': 11 },
+  paint: { 'text-color': '#fff', 'text-halo-color': '#000', 'text-halo-width': 1.5 } });
+
+layers.push({ id: 'tower', type: 'circle', source: 'power', 'source-layer': 'power_tower', minzoom: 13,
+  paint: { 'circle-color': '#ffffff', 'circle-stroke-color': '#222', 'circle-stroke-width': 0.5,
+    'circle-radius': ['interpolate', ['linear'], ['zoom'], 13, 1.5, 18, 5] } });
+
+// Added after the lines so the dots draw on top of them.
+layers.push({ id: 'sub-dot-big', type: 'circle', source: 'power', 'source-layer': 'power_substation_point', minzoom: 7,
+  filter: ['all', IS_BIG_SUB, ['==', ['get', 'is_node'], false]],
+  paint: { 'circle-color': '#ff3b3b', 'circle-stroke-color': '#222', 'circle-stroke-width': 1,
+    'circle-radius': ['interpolate', ['linear'], ['zoom'], 7, 3, 12, 5, 17, 9] } });
+
+layers.push(
+  { id: STREET_LABELS, type: 'symbol', source: 'omt', 'source-layer': 'transportation_name',
+    filter: ['!=', ['get', 'class'], 'path'],
+    layout: { 'symbol-placement': 'line', 'text-field': ['get', 'name'], 'text-font': ['Noto Sans Regular'],
+      'text-size': ['interpolate', ['linear'], ['zoom'], 12, 10, 18, 15], visibility: 'none' },
+    paint: { 'text-halo-width': 1.5 } },
+  { id: PLACE_LABELS, type: 'symbol', source: 'omt', 'source-layer': 'place',
+    layout: { 'text-field': ['get', 'name'], 'text-font': ['Noto Sans Bold'],
+      'text-size': ['interpolate', ['linear'], ['zoom'], 4, 11, 14, 18], visibility: 'none' },
+    paint: { 'text-halo-width': 1.5 } },
+);
+
+const map = new maplibregl.Map({
+  container: 'map', maxZoom: 19,
+  center: cfg.remember && cfg.view ? cfg.view.center : RIGA,
+  zoom: cfg.remember && cfg.view ? cfg.view.zoom : 12,
+  style: { version: 8, sources, layers, glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf' },
+});
+map.addControl(new maplibregl.NavigationControl(), 'bottom-right');
+map.on('moveend', () => {
+  if (!cfg.remember) return;
+  cfg.view = { center: map.getCenter().toArray(), zoom: map.getZoom() };
+  persist();
+});
+
+const layerIdsOf = c => c.id === 'sub' ? ['sub-fill', 'sub-outline', 'plant-fill', 'sub-dot-big', 'sub-point']
+  : c.id === 'tower' ? ['tower'] : [c.id, `${c.id}-glow`];
+
+function applyConfig() {
+  for (const name of Object.keys(BASES)) {
+    map.setLayoutProperty(baseId(name), 'visibility', name === cfg.base ? 'visible' : 'none');
+  }
+  const showLabels = cfg.names && (cfg.base === SATELLITE || cfg.labelsAll);
+  for (const id of [STREET_LABELS, PLACE_LABELS]) {
+    map.setLayoutProperty(id, 'visibility', showLabels ? 'visible' : 'none');
+    map.setPaintProperty(id, 'text-color', LIGHT_BASES.includes(cfg.base) ? '#222' : '#fff');
+    map.setPaintProperty(id, 'text-halo-color', LIGHT_BASES.includes(cfg.base) ? '#fff' : '#000');
+    map.setLayerZoomRange(id, LABEL_MIN_ZOOM[id], 24);
+  }
+  for (const c of CLASSES) {
+    for (const id of layerIdsOf(c)) {
+      const isGlow = id.endsWith('-glow');
+      map.setLayoutProperty(id, 'visibility', cfg.on[c.id] && (!isGlow || cfg.glow) ? 'visible' : 'none');
+    }
+  }
+  for (const c of LINE_CLASSES) {
+    map.setPaintProperty(c.id, 'line-width', widthExpr(c.width));
+    map.setPaintProperty(c.id, 'line-opacity', cfg.opacity);
+    map.setPaintProperty(`${c.id}-glow`, 'line-width', widthExpr(c.width * 3.5));
+    map.setPaintProperty(`${c.id}-glow`, 'line-opacity', cfg.glowStrength * cfg.opacity);
+  }
+  for (const id of ['sub-fill', 'plant-fill']) map.setPaintProperty(id, 'fill-opacity', 0.35 * cfg.opacity);
+}
+
+const clickable = CLASSES.flatMap(c => c.id === 'sub' ? ['sub-fill', 'sub-dot-big', 'sub-point'] : c.id === 'tower' ? ['tower'] : [c.id]);
+map.on('click', e => {
+  const r = 5;
+  const [f] = map.queryRenderedFeatures([[e.point.x - r, e.point.y - r], [e.point.x + r, e.point.y + r]], { layers: clickable });
+  if (!f) return;
+  const p = f.properties;
+  const rows = ['type', 'voltage', 'voltage_2', 'operator', 'name', 'ref', 'substation', 'usage']
+    .filter(k => p[k]).map(k => `<b>${k}</b>: ${String(p[k]).replace(/</g, '&lt;')}${k.startsWith('voltage') ? ' kV' : ''}`);
+  new maplibregl.Popup().setLngLat(e.lngLat).setHTML(rows.join('<br>') || 'No details').addTo(map);
+});
+map.on('mousemove', e => {
+  map.getCanvas().style.cursor = map.queryRenderedFeatures(e.point, { layers: clickable }).length ? 'pointer' : '';
+});
+
+let me;
+function locate() {
+  navigator.geolocation?.getCurrentPosition(pos => {
+    const ll = [pos.coords.longitude, pos.coords.latitude];
+    map.flyTo({ center: ll, zoom: 14 });
+    me?.remove();
+    me = new maplibregl.Marker({ color: '#2a7fff' }).setLngLat(ll).addTo(map);
+  }, () => { $('hint').textContent = 'Location unavailable, showing Riga.'; }, { timeout: 8000 });
+}
+
+function buildPanel() {
+  $('base').innerHTML = Object.keys(BASES).map(k => `<option>${k}</option>`).join('');
+  $('base').value = cfg.base;
+  $('classes').innerHTML = CLASSES.map(c =>
+    `<label><input type="checkbox" data-cls="${c.id}" ${cfg.on[c.id] ? 'checked' : ''}>
+     <span class="sw" style="background:${c.color}"></span>${c.label}</label>`).join('');
+  for (const id of ['width', 'opacity']) $(id).value = cfg[id];
+  $('glow').checked = cfg.glow;
+  for (const el of document.querySelectorAll('[data-key]')) {
+    el[el.type === 'checkbox' ? 'checked' : 'value'] = cfg[el.dataset.key];
+  }
+}
+
+$('base').onchange = e => { cfg.base = e.target.value; persist(); applyConfig(); };
+$('classes').onchange = e => { cfg.on[e.target.dataset.cls] = e.target.checked; persist(); applyConfig(); };
+for (const id of ['width', 'opacity']) {
+  $(id).oninput = e => { cfg[id] = +e.target.value; persist(); applyConfig(); };
+}
+$('glow').onchange = e => { cfg.glow = e.target.checked; persist(); applyConfig(); };
+for (const el of document.querySelectorAll('[data-key]')) {
+  el.oninput = () => {
+    cfg[el.dataset.key] = el.type === 'checkbox' ? el.checked : +el.value;
+    persist(); applyConfig();
+  };
+}
+$('reset').onclick = () => { localStorage.removeItem('gridMap'); location.reload(); };
+$('locate').onclick = locate;
+$('riga').onclick = () => map.flyTo({ center: RIGA, zoom: 12 });
+
+let pin;
+$('search').onsubmit = async e => {
+  e.preventDefault();
+  const q = $('q').value.trim();
+  if (!q) return;
+  const box = $('results');
+  box.innerHTML = '<div class="none">Searching…</div>';
+  try {
+    const res = await fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=' + encodeURIComponent(q));
+    if (!res.ok) throw new Error(res.status);
+    const hits = await res.json();
+    box.innerHTML = hits.length ? '' : '<div class="none">No results</div>';
+    for (const h of hits) {
+      const row = document.createElement('div');
+      row.textContent = h.display_name;
+      row.onclick = () => {
+        const ll = [+h.lon, +h.lat];
+        map.flyTo({ center: ll, zoom: 16 });
+        pin?.remove();
+        pin = new maplibregl.Marker({ color: '#ff4081' }).setLngLat(ll).addTo(map);
+        box.innerHTML = '';
+      };
+      box.append(row);
+    }
+  } catch (err) {
+    box.innerHTML = `<div class="none">Search failed (${err.message})</div>`;
+  }
+};
+
+persist();
+buildPanel();
+map.on('load', () => { applyConfig(); if (!(cfg.remember && cfg.view)) locate(); });
+</script>
+</body>
+</html>
